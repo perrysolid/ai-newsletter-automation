@@ -258,7 +258,8 @@ def search_arxiv_papers(
     )
     
     papers = []
-    for result in search.results():
+    client = arxiv.Client()
+    for result in client.results(search):
         # Filter by date
         if result.published.replace(tzinfo=None) >= date_threshold:
             papers.append({
