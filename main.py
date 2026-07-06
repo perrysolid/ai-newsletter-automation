@@ -21,6 +21,8 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
+import base64
+from email.mime.text import MIMEText
 
 # Setup logging
 logging.basicConfig(
@@ -670,7 +672,7 @@ def preview_newsletter(draft_content: Dict) -> Dict:
     preview = f"""
 {'='*60}
 {metadata.get('title', 'Newsletter Preview')}
-Issue #{metadata.get('issue_number', 'N/A')} | {metadata.get('date', '')}
+Issue #{metadata.get('issue_number', 'N/A')} | **Issue #{metadata.get('issue_number', 'N/A')}** | {metadata.get('date', '')}
 {'='*60}
 
 📊 CONTENT SUMMARY:
@@ -1052,7 +1054,7 @@ def convert_to_markdown(content: Dict) -> str:
     sections = content.get("sections", {})
     
     md = f"""# {metadata.get('title', 'Newsletter')}
-**Issue #{metadata.get('issue_number', 'N/A')}** | {metadata.get('date', '')}
+{metadata.get('date', '')}
 
 ---
 
@@ -1124,6 +1126,154 @@ def convert_to_markdown(content: Dict) -> str:
     md += "\n**Thanks for reading! 🙌**\n\n*Built with ❤️ by CampusX*\n"
     
     return md
+
+
+# ==================== DISTRIBUTION PHASE TOOLS ====================
+
+SUBSCRIBERS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subscribers.txt")
+
+
+def load_subscribers() -> List[str]:
+    """Read subscriber emails from subscribers.txt (one per line, # for comments)"""
+    if not os.path.exists(SUBSCRIBERS_FILE):
+        return []
+    with open(SUBSCRIBERS_FILE) as f:
+        return [line.strip() for line in f if line.strip() and not line.strip().startswith("#")]
+
+
+@mcp.tool()
+def list_subscribers() -> Dict:
+    """
+    List all newsletter subscribers.
+
+    Returns:
+        List of subscriber email addresses
+    """
+    subscribers = load_subscribers()
+    return {
+        "status": "success",
+        "count": len(subscribers),
+        "subscribers": subscribers
+    }
+
+
+@mcp.tool()
+def add_subscriber(email: str) -> Dict:
+    """
+    Add a subscriber email to the newsletter list.
+
+    Args:
+        email: Email address to add
+
+    Returns:
+        Updated subscriber count
+    """
+    email = email.strip().lower()
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return {"status": "error", "message": f"Invalid email address: {email}"}
+
+    subscribers = load_subscribers()
+    if email in subscribers:
+        return {"status": "success", "message": f"{email} is already subscribed", "count": len(subscribers)}
+
+    with open(SUBSCRIBERS_FILE, "a") as f:
+        f.write(email + "\n")
+
+    logger.info(f"Added subscriber: {email}")
+    return {"status": "success", "message": f"Added {email}", "count": len(subscribers) + 1}
+
+
+@mcp.tool()
+def remove_subscriber(email: str) -> Dict:
+    """
+    Remove a subscriber email from the newsletter list.
+
+    Args:
+        email: Email address to remove
+
+    Returns:
+        Updated subscriber count
+    """
+    email = email.strip().lower()
+    subscribers = load_subscribers()
+    if email not in subscribers:
+        return {"status": "error", "message": f"{email} is not in the subscriber list"}
+
+    subscribers.remove(email)
+    with open(SUBSCRIBERS_FILE, "w") as f:
+        f.write("\n".join(subscribers) + ("\n" if subscribers else ""))
+
+    logger.info(f"Removed subscriber: {email}")
+    return {"status": "success", "message": f"Removed {email}", "count": len(subscribers)}
+
+
+@mcp.tool()
+@safe_api_call
+def send_newsletter_email(
+    subject: str,
+    html_content: Optional[str] = None,
+    drive_file_id: Optional[str] = None,
+    recipients: Optional[List[str]] = None,
+    test_only: bool = False
+) -> Dict:
+    """
+    Send the newsletter to subscribers via Gmail (as BCC to protect privacy).
+
+    Args:
+        subject: Email subject line
+        html_content: Newsletter HTML (or use drive_file_id instead)
+        drive_file_id: Google Drive file ID to send (e.g. from save_to_drive)
+        recipients: Explicit recipient list (defaults to subscribers.txt)
+        test_only: If True, send only to yourself as a preview
+
+    Returns:
+        Send confirmation with recipient count
+    """
+    if not html_content and not drive_file_id:
+        return {"status": "error", "message": "Provide html_content or drive_file_id"}
+
+    # Fetch HTML from Drive if a file ID was given
+    if drive_file_id and not html_content:
+        drive = get_google_service('drive', 'v3')
+        html_content = drive.files().get_media(fileId=drive_file_id).execute().decode('utf-8')
+
+    gmail = get_google_service('gmail', 'v1')
+    sender = gmail.users().getProfile(userId='me').execute()['emailAddress']
+
+    if test_only:
+        recipients = [sender]
+    elif recipients is None:
+        recipients = load_subscribers()
+
+    if not recipients:
+        return {
+            "status": "error",
+            "message": "No recipients. Add subscribers with add_subscriber() or create subscribers.txt"
+        }
+
+    # Send in batches of 90 BCC recipients (Gmail limits recipients per message)
+    sent_batches = 0
+    for i in range(0, len(recipients), 90):
+        batch = recipients[i:i + 90]
+        message = MIMEText(html_content, 'html')
+        message['To'] = sender
+        message['Bcc'] = ", ".join(batch)
+        message['Subject'] = subject
+
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        gmail.users().messages().send(userId='me', body={'raw': raw}).execute()
+        sent_batches += 1
+
+    logger.info(f"Newsletter sent to {len(recipients)} recipients in {sent_batches} batch(es)")
+
+    return {
+        "status": "success",
+        "recipients_count": len(recipients),
+        "batches": sent_batches,
+        "from": sender,
+        "subject": subject,
+        "test_only": test_only
+    }
 
 
 # ==================== BATCH OPERATIONS ====================
