@@ -1,0 +1,9 @@
+# Credentials — never commit
+.env
+
+# Python
+__pycache__/
+.venv/
+
+# Subscriber emails are personal data
+subscribers.txt
